@@ -279,19 +279,70 @@ def scrape_amazon_page(category_name, url, list_type="BS"):
     return sorted_prods
 
 
-def scrape_amazon(category_name, use_bs=True, use_ms=False):
+def discover_subcategories(base_url, cat_slug):
+    """カテゴリページからサブカテゴリURLを自動取得"""
+    html = fetch(base_url, delay=1.5)
+    if not html:
+        return []
+    pattern = rf'/gp/bestsellers/{cat_slug}/(\d+)/[^\"]*'
+    seen, subs = set(), []
+    for m in re.finditer(rf'href=\"({pattern})\"', html):
+        path = m.group(1)
+        cat_id = m.group(2)
+        if cat_id not in seen:
+            seen.add(cat_id)
+            subs.append(f"https://www.amazon.co.jp{path}")
+    return subs
+
+
+def scrape_amazon(category_name, use_bs=True, use_ms=False, target=200):
+    """サブカテゴリを自動検出して合計 target 件取得"""
     all_prods = []
+    seen_asins = set()
+
+    def add_from_page(url, list_type):
+        prods = scrape_amazon_page(category_name, url, list_type)
+        added = 0
+        for p in prods:
+            if p["asin"] not in seen_asins:
+                seen_asins.add(p["asin"])
+                all_prods.append(p)
+                added += 1
+        return added
 
     if use_bs and category_name in AMAZON_BS_URLS:
-        print(f"  Amazon ベストセラー [{category_name}]...")
-        prods = scrape_amazon_page(category_name, AMAZON_BS_URLS[category_name], "BS")
-        all_prods.extend(prods)
+        base_url = AMAZON_BS_URLS[category_name]
+        cat_slug  = base_url.rstrip("/").split("/")[-1]
+
+        # メインページ
+        print(f"  [BS メイン] {category_name}...")
+        add_from_page(base_url, "BS")
+
+        # 不足分をサブカテゴリで補う
+        if len(all_prods) < target:
+            subs = discover_subcategories(base_url, cat_slug)
+            print(f"  サブカテゴリ {len(subs)}件 発見")
+            for sub_url in subs:
+                if len(all_prods) >= target:
+                    break
+                print(f"  [BS サブ] {sub_url.split('/')[-2]}...")
+                add_from_page(sub_url, "BS_sub")
 
     if use_ms and category_name in AMAZON_MS_URLS:
-        print(f"  Amazon 急上昇 [{category_name}]...")
-        prods = scrape_amazon_page(category_name, AMAZON_MS_URLS[category_name], "MS")
-        all_prods.extend(prods)
+        base_url = AMAZON_MS_URLS[category_name]
+        cat_slug  = base_url.rstrip("/").split("/")[-1]
+        print(f"  [MS メイン] {category_name}...")
+        add_from_page(base_url, "MS")
 
+        if len(all_prods) < target:
+            subs = discover_subcategories(base_url, cat_slug)
+            for sub_url in subs:
+                if len(all_prods) >= target:
+                    break
+                print(f"  [MS サブ] {sub_url.split('/')[-2]}...")
+                add_from_page(sub_url, "MS_sub")
+
+    print(f"  → {category_name} 合計 {len(all_prods)}件")
     return all_prods
 
 

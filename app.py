@@ -16,6 +16,7 @@ from picker import (
     AMAZON_BS_URLS, AMAZON_MS_URLS, score,
     decode_url_title, extract_amazon_ratings,
     fetch_amazon_detail, fetch_yahoo_price,
+    discover_subcategories,
 )
 
 app = Flask(__name__)
@@ -86,37 +87,66 @@ def scrape_ranking(cat, url, list_type, log):
 
     return sorted_prods
 
+TARGET_PER_CAT = 200
+
 def run_task(task_id, categories, source):
     t = tasks[task_id]
 
     def log(msg):
         t["logs"].append(msg)
 
+    def scrape_with_subs(cat, base_url, list_type, seen_asins):
+        """メイン + サブカテゴリを使って target 件集める"""
+        cat_slug = base_url.rstrip("/").split("/")[-1]
+        prods = []
+
+        def add(url, ltype):
+            results = scrape_ranking(cat, url, ltype, log)
+            added = 0
+            for p in results:
+                if p["asin"] not in seen_asins:
+                    seen_asins.add(p["asin"])
+                    prods.append(p)
+                    added += 1
+            return added
+
+        log(f"[{list_type} メイン] {cat}")
+        add(base_url, list_type)
+
+        if len(prods) < TARGET_PER_CAT:
+            subs = discover_subcategories(base_url, cat_slug)
+            log(f"  サブカテゴリ {len(subs)}件 発見")
+            for sub_url in subs:
+                if len(prods) >= TARGET_PER_CAT:
+                    break
+                sub_id = sub_url.split("/")[-2]
+                log(f"  [{list_type} サブ/{sub_id}] 取得中...")
+                add(sub_url, f"{list_type}_sub")
+
+        log(f"  ✓ {cat}: {len(prods)}件")
+        return prods
+
     try:
         use_bs = source in ("bs", "both")
         use_ms = source in ("ms", "both")
         all_prods = []
-        total_steps = len(categories) * ((1 if use_bs else 0) + (1 if use_ms else 0))
+        seen_asins = set()
+        total_steps = len(categories)
         done = 0
 
         for cat in categories:
+            t["pct"] = int(done / max(total_steps, 1) * 88)
+            t["label"] = f"{cat} 取得中..."
+
             if use_bs and cat in AMAZON_BS_URLS:
-                t["pct"] = int(done / max(total_steps, 1) * 90)
-                t["label"] = f"[ベストセラー] {cat}"
-                log(f"[ベストセラー] {cat} を取得中...")
-                prods = scrape_ranking(cat, AMAZON_BS_URLS[cat], "BS", log)
-                log(f"  ✓ {len(prods)}件")
+                prods = scrape_with_subs(cat, AMAZON_BS_URLS[cat], "BS", seen_asins)
                 all_prods.extend(prods)
-                done += 1
 
             if use_ms and cat in AMAZON_MS_URLS:
-                t["pct"] = int(done / max(total_steps, 1) * 90)
-                t["label"] = f"[急上昇] {cat}"
-                log(f"[急上昇] {cat} を取得中...")
-                prods = scrape_ranking(cat, AMAZON_MS_URLS[cat], "MS", log)
-                log(f"  ✓ {len(prods)}件")
+                prods = scrape_with_subs(cat, AMAZON_MS_URLS[cat], "MS", seen_asins)
                 all_prods.extend(prods)
-                done += 1
+
+            done += 1
 
         log("スコアリング中...")
         for p in all_prods:
