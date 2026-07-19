@@ -132,10 +132,46 @@ def fetch_yahoo_price(title):
 
 # ─── Amazon 個別ページから詳細情報を取得 ────────────────────
 
+def fetch_price_only(asin):
+    """価格だけ高速取得（詳細なし）"""
+    html = fetch(f"https://www.amazon.co.jp/dp/{asin}/", delay=0.4)
+    if not html:
+        return 0
+    for pat in [
+        r'class="[^"]*a-price-whole[^"]*"[^>]*>([\d,]+)<',
+        r'"priceAmount":([\d.]+)',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            try:
+                n = int(float(m.group(1).replace(",", "")))
+                if 10 <= n <= 10000000:
+                    return n
+            except ValueError:
+                pass
+    return 0
+
+
+def batch_fetch_prices(products, workers=8):
+    """全商品の価格を並列一括取得"""
+    need = [p for p in products if not p.get("price_num")]
+    if not need:
+        return
+
+    def _fetch(p):
+        price = fetch_price_only(p["asin"])
+        if price:
+            p["price_num"] = price
+            p["price"]     = f"¥{price:,}"
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_fetch, need))
+
+
 def fetch_amazon_detail(asin, title="", category=""):
     """ASIN から価格・レビュー・メーカー・月間販売数を取得"""
     url = f"https://www.amazon.co.jp/dp/{asin}/"
-    html = fetch(url, delay=1.5)
+    html = fetch(url, delay=0.5)
     result = {
         "price_num": 0, "price": "不明",
         "reviews": 0, "maker": "", "monthly_sales": 0,
@@ -355,7 +391,11 @@ def scrape_amazon(category_name, use_bs=True, use_ms=False, target=200):
         all_prods.extend(prods)
         print(f"  [MS] {category_name}: {len(prods)}件")
 
-    print(f"  → {category_name} 合計 {len(all_prods)}件")
+    # 価格未取得商品を一括並列取得
+    print(f"  価格一括取得中...")
+    batch_fetch_prices(all_prods, workers=8)
+    priced = sum(1 for p in all_prods if p.get("price_num"))
+    print(f"  → {category_name} 合計 {len(all_prods)}件（価格取得: {priced}件）")
     return all_prods
 
 

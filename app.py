@@ -17,7 +17,7 @@ from picker import (
     AMAZON_BS_URLS, AMAZON_MS_URLS, score,
     decode_url_title, extract_amazon_ratings,
     fetch_amazon_detail, fetch_yahoo_price,
-    discover_subcategories,
+    discover_subcategories, batch_fetch_prices,
 )
 
 app = Flask(__name__)
@@ -164,6 +164,15 @@ def run_task(task_id, categories, source):
                 t["pct"] = int(done / total * 90)
                 t["label"] = f"{cat} 完了 ({done}/{total})"
                 log(f"✓ {cat}: {len(prods)}件")
+
+        # 価格未取得商品を一括並列取得
+        unpriced = [p for p in all_prods if not p.get("price_num")]
+        if unpriced:
+            log(f"価格一括取得中... ({len(unpriced)}件)")
+            t["label"] = f"価格取得中 ({len(unpriced)}件)..."
+            batch_fetch_prices(unpriced, workers=10)
+            priced = sum(1 for p in all_prods if p.get("price_num"))
+            log(f"  価格取得完了: {priced}/{len(all_prods)}件")
 
         log("スコアリング中...")
         for p in all_prods:
