@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
-from urllib.parse import unquote
+from urllib.parse import unquote, quote_plus
 from collections import defaultdict
 
 # ─── 設定 ────────────────────────────────────────────────────
@@ -87,52 +87,139 @@ def extract_amazon_ratings(html):
     return asin_rating
 
 
-# ─── Amazon 個別ページから価格・レビュー取得 ──────────────────
+# ─── BSRから月間販売数を推定 ─────────────────────────────────
 
-def fetch_amazon_detail(asin):
-    """ASIN から価格・レビュー数を取得（上位商品のみ）"""
+def estimate_monthly_sales(bsr, category="general"):
+    """BSRランクから月間販売数を推定（近似値）"""
+    multipliers = {
+        "おもちゃ": 3.0, "家電": 2.0, "ビューティー": 4.0,
+        "スポーツ": 2.5, "ホーム＆キッチン": 3.5, "文房具": 2.0,
+        "ペット用品": 2.5, "食品": 5.0, "ヘルス": 3.0,
+    }
+    m = multipliers.get(category, 3.0)
+    if   bsr <= 10:    return int(m * 5000)
+    elif bsr <= 50:    return int(m * 2000)
+    elif bsr <= 100:   return int(m * 1000)
+    elif bsr <= 500:   return int(m * 400)
+    elif bsr <= 1000:  return int(m * 200)
+    elif bsr <= 3000:  return int(m * 80)
+    elif bsr <= 5000:  return int(m * 40)
+    else:              return int(m * 20)
+
+
+# ─── Yahoo!ショッピングから仕入れ参考価格を取得 ──────────────
+
+def fetch_yahoo_price(title):
+    """Yahoo!ショッピングで最安値を検索（仕入れ参考値）"""
+    query = title[:25]  # 短くして検索精度を上げる
+    url = f"https://shopping.yahoo.co.jp/search?p={quote_plus(query)}&sort=price&order=a"
+    html = fetch(url, delay=1.2)
+    if not html:
+        return 0
+
+    # JSONデータから価格抽出
+    prices = re.findall(r'"price":([\d]+)', html)
+    candidates = [int(p) for p in prices if 100 <= int(p) <= 500000]
+    if candidates:
+        return min(candidates)
+
+    # フォールバック: テキストから円価格抽出
+    raw = re.findall(r'([\d,]+)円', html)
+    nums = sorted([int(p.replace(",", "")) for p in raw if 100 <= int(p.replace(",", "")) <= 500000])
+    return nums[0] if nums else 0
+
+
+# ─── Amazon 個別ページから詳細情報を取得 ────────────────────
+
+def fetch_amazon_detail(asin, title="", category=""):
+    """ASIN から価格・レビュー・メーカー・月間販売数を取得"""
     url = f"https://www.amazon.co.jp/dp/{asin}/"
     html = fetch(url, delay=1.5)
+    result = {
+        "price_num": 0, "price": "不明",
+        "reviews": 0, "maker": "", "monthly_sales": 0,
+        "supply_price": 0, "supply_price_str": "不明",
+    }
     if not html:
-        return 0, 0
+        return result
 
-    # 価格
-    price_num = 0
-    price_patterns = [
-        r'priceblock_ourprice[^>]*>(¥[\d,]+)<',
-        r'"priceAmount":([\d.]+)',
+    # 価格（複数パターン試行）
+    for pat in [
         r'<span[^>]*class="[^"]*a-price-whole[^"]*"[^>]*>([\d,]+)<',
-        r'\"price\":\s*\"([\d,]+)\"',
-        r'([\d,]+)円\s*\(税込\)',
-        r'([\d,]+)円',
-    ]
-    for pat in price_patterns:
-        pm = re.search(pat, html)
+        r'"priceAmount":([\d.]+)',
+        r'"price":\{"amount":([\d.]+)',
+        r'data-a-color="price"[^>]*>.*?<span[^>]*>([\d,]+)<',
+    ]:
+        pm = re.search(pat, html, re.DOTALL)
         if pm:
-            raw = pm.group(1).replace("¥", "").replace(",", "")
             try:
-                num = int(float(raw))
+                num = int(float(pm.group(1).replace(",", "")))
                 if 10 <= num <= 10000000:
-                    price_num = num
+                    result["price_num"] = num
+                    result["price"]     = f"¥{num:,}"
                     break
             except ValueError:
-                continue
+                pass
 
     # レビュー数
-    reviews = 0
-    rev_patterns = [
-        r'([\d,]+)個の評価',
-        r'([\d,]+)件のカスタマーレビュー',
-        r'"ratingCount":([\d]+)',
-        r'ratingsCount[^>]*>([\d,]+)<',
-    ]
-    for pat in rev_patterns:
+    for pat in [r'([\d,]+)個の評価', r'([\d,]+)件のカスタマーレビュー']:
         rm = re.search(pat, html)
         if rm:
-            reviews = int(rm.group(1).replace(",", ""))
+            result["reviews"] = int(rm.group(1).replace(",", ""))
             break
 
-    return price_num, reviews
+    # メーカー名（ブランド）
+    brand_m = re.search(r'<a[^>]*id="bylineInfo"[^>]*>([^<]+)<', html)
+    if brand_m:
+        brand = brand_m.group(1).strip()
+        brand = re.sub(r'のストアを表示|のストア|ブランド:|Visit the .+ Store|のブランドページ', '', brand).strip()
+        brand = re.sub(r'\s+', ' ', brand).strip()
+        if brand:
+            result["maker"] = brand
+
+    # メーカー（商品詳細テーブルから）
+    if not result["maker"]:
+        for pat in [
+            r'<th[^>]*>[^<]*ブランド[^<]*</th>\s*<td[^>]*><span[^>]*>([^<]{2,40})</span>',
+            r'ブランド</th>.*?<td[^>]*>([^<]{2,40})</td>',
+        ]:
+            mk = re.search(pat, html, re.DOTALL)
+            if mk:
+                result["maker"] = mk.group(1).strip()
+                break
+
+    # 月間販売数（ページに表示されている場合）
+    monthly_m = re.search(r'([\d,+]+)\s*個購入（過去|過去1ヶ月で([\d,+]+)', html)
+    if monthly_m:
+        raw = (monthly_m.group(1) or monthly_m.group(2) or "0").replace(",", "").replace("+", "")
+        result["monthly_sales"] = int(raw)
+    else:
+        # BSR推定
+        result["monthly_sales"] = estimate_monthly_sales(
+            category_name_to_bsr_rank(title, html), category
+        )
+
+    # 仕入れ参考価格（Yahoo!ショッピング）
+    if title:
+        supply = fetch_yahoo_price(title)
+        if supply:
+            result["supply_price"]     = supply
+            result["supply_price_str"] = f"¥{supply:,}"
+
+    return result
+
+
+def category_name_to_bsr_rank(title, html):
+    """HTMLからBSRランクを取得（なければデフォルト）"""
+    for pat in [
+        r'売れ筋ランキング.*?(\d[\d,]+)\s*位',
+        r'Best Sellers Rank.*?#([\d,]+)',
+        r'(\d[\d,]+)\s*位\s*（',
+    ]:
+        bsr_m = re.search(pat, html, re.DOTALL)
+        if bsr_m:
+            return int(bsr_m.group(1).replace(",", ""))
+    return 500  # デフォルト
 
 
 # ─── Amazon ベストセラー / ムーバーズ スクレイパー ────────────
@@ -172,17 +259,22 @@ def scrape_amazon_page(category_name, url, list_type="BS"):
         if asin in products:
             products[asin]["rating"] = rating
 
-    # Step3: 価格はページ内にない→上位10件のみ個別ページで取得
+    # Step3: 上位10件は個別ページで詳細取得
     sorted_prods = sorted(products.values(), key=lambda x: x["rank"])
-    print(f"    ランキング {len(sorted_prods)}件取得, 上位10件の価格を個別取得中...")
+    print(f"    ランキング {len(sorted_prods)}件取得, 上位10件の詳細取得中...")
 
     for p in sorted_prods[:10]:
-        price_num, reviews = fetch_amazon_detail(p["asin"])
-        if price_num:
-            p["price_num"] = price_num
-            p["price"]     = f"¥{price_num:,}"
-        if reviews:
-            p["reviews"] = reviews
+        detail = fetch_amazon_detail(p["asin"], p.get("title", ""), category_name)
+        if detail["price_num"]:
+            p["price_num"] = detail["price_num"]
+            p["price"]     = detail["price"]
+        if detail["reviews"]:
+            p["reviews"]   = detail["reviews"]
+        if detail["maker"]:
+            p["maker"]     = detail["maker"]
+        p["monthly_sales"]      = detail["monthly_sales"]
+        p["supply_price"]       = detail["supply_price"]
+        p["supply_price_str"]   = detail["supply_price_str"]
 
     return sorted_prods
 

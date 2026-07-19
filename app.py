@@ -15,6 +15,7 @@ from flask import Flask, request, jsonify
 from picker import (
     AMAZON_BS_URLS, AMAZON_MS_URLS, score,
     decode_url_title, extract_amazon_ratings,
+    fetch_amazon_detail, fetch_yahoo_price,
 )
 
 app = Flask(__name__)
@@ -69,30 +70,19 @@ def scrape_ranking(cat, url, list_type, log):
     sorted_prods = sorted(products.values(), key=lambda x: x["rank"])
     log(f"  ランキング {len(sorted_prods)}件取得")
 
-    # 上位5件だけ個別ページで価格取得
+    # 上位5件の詳細情報取得（価格・メーカー・月間販売数・仕入れ値）
     for j, p in enumerate(sorted_prods[:5]):
-        log(f"  価格取得中 ({j+1}/5): {p['title'][:25]}...")
-        detail = fetch_html(f"https://www.amazon.co.jp/dp/{p['asin']}/", delay=1.2)
-        if detail:
-            for pat in [
-                r'<span[^>]*class="[^"]*a-price-whole[^"]*"[^>]*>([\d,]+)<',
-                r'"priceAmount":([\d.]+)',
-            ]:
-                pm = re.search(pat, detail)
-                if pm:
-                    try:
-                        num = int(float(pm.group(1).replace(",", "")))
-                        if 10 <= num <= 10000000:
-                            p["price_num"] = num
-                            p["price"] = f"¥{num:,}"
-                            break
-                    except ValueError:
-                        pass
-            for pat in [r'([\d,]+)個の評価', r'([\d,]+)件のカスタマーレビュー']:
-                rm = re.search(pat, detail)
-                if rm:
-                    p["reviews"] = int(rm.group(1).replace(",", ""))
-                    break
+        log(f"  詳細取得 ({j+1}/5): {p['title'][:22]}...")
+        detail = fetch_amazon_detail(p["asin"], p.get("title", ""), cat)
+        if detail["price_num"]:
+            p["price_num"] = detail["price_num"]
+            p["price"]     = detail["price"]
+        if detail["reviews"]:
+            p["reviews"]   = detail["reviews"]
+        p["maker"]              = detail.get("maker", "")
+        p["monthly_sales"]      = detail.get("monthly_sales", 0)
+        p["supply_price"]       = detail.get("supply_price", 0)
+        p["supply_price_str"]   = detail.get("supply_price_str", "不明")
 
     return sorted_prods
 
@@ -292,10 +282,12 @@ a.tlink:hover{{color:var(--orange);text-decoration:underline}}
                 <th onclick="srt('rank')">#</th>
                 <th onclick="srt('score')">スコア↕</th>
                 <th>カテゴリ</th>
-                <th>ソース</th>
-                <th onclick="srt('price_num')">価格↕</th>
+                <th onclick="srt('price_num')">販売価格↕</th>
+                <th onclick="srt('supply_price')">仕入れ参考値↕</th>
+                <th onclick="srt('monthly_sales')">月間販売数↕</th>
                 <th onclick="srt('rating')">評価↕</th>
                 <th onclick="srt('reviews')">レビュー↕</th>
+                <th>メーカー</th>
                 <th>商品名</th>
               </tr>
             </thead>
@@ -416,15 +408,23 @@ function render(data) {{
   var html = '';
   for (var i = 0; i < data.length; i++) {{
     var p = data[i];
-    var t = p.title ? (p.title.length > 50 ? p.title.substring(0,50)+'…' : p.title) : '-';
+    var t = p.title ? (p.title.length > 46 ? p.title.substring(0,46)+'…' : p.title) : '-';
+    var profit = (p.price_num && p.supply_price)
+      ? Math.round(p.price_num * 0.85 - p.supply_price)  // Amazon手数料15%引き後の利益
+      : null;
+    var profitCell = profit !== null
+      ? '<span style="color:'+(profit>0?'#81c784':'#ef9a9a')+';font-weight:600">'+(profit>0?'+':'')+profit.toLocaleString()+'円</span>'
+      : '-';
     html += '<tr>' +
       '<td style="color:var(--muted)">'+(i+1)+'</td>' +
       '<td><span class="sc '+scClass(p.score)+'">'+p.score+'</span></td>' +
-      '<td>'+p.category+'</td>' +
-      '<td style="color:var(--muted)">'+p.source+'</td>' +
+      '<td style="font-size:11px">'+p.category+'</td>' +
       '<td style="font-weight:600">'+(p.price||'-')+'</td>' +
+      '<td style="color:#7986cb">'+(p.supply_price_str||'-')+'</td>' +
+      '<td style="color:#ffca28">'+(p.monthly_sales?'約'+p.monthly_sales.toLocaleString()+'個':'-')+'</td>' +
       '<td>'+stars(p.rating)+'</td>' +
-      '<td>'+(p.reviews?p.reviews.toLocaleString():'-')+'</td>' +
+      '<td style="font-size:11px">'+(p.reviews?p.reviews.toLocaleString():'-')+'</td>' +
+      '<td style="font-size:11px;color:var(--muted)">'+(p.maker||'-')+'</td>' +
       '<td><a class="tlink" href="'+(p.url||'#')+'" target="_blank">'+t+'</a></td>' +
     '</tr>';
   }}
@@ -442,9 +442,9 @@ function srt(key) {{
 }}
 
 function dlCSV() {{
-  var h = ['スコア','ランク','カテゴリ','ソース','商品名','価格','評価','レビュー数','ASIN','URL'];
+  var h = ['スコア','ランク','カテゴリ','ソース','商品名','販売価格','仕入れ参考値','月間販売数(推定)','評価','レビュー数','メーカー','ASIN','URL'];
   var rows = allData.map(function(p) {{
-    return [p.score,p.rank,p.category,p.source,p.title,p.price||'',p.rating||'',p.reviews||'',p.asin||'',p.url||''];
+    return [p.score,p.rank,p.category,p.source,p.title,p.price||'',p.supply_price_str||'',p.monthly_sales||'',p.rating||'',p.reviews||'',p.maker||'',p.asin||'',p.url||''];
   }});
   var csv = [h].concat(rows).map(function(r) {{
     return r.map(function(v){{ return '"'+String(v).replace(/"/g,'""')+'"'; }}).join(',');
