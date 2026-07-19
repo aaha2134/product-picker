@@ -6,6 +6,7 @@ import time
 import random
 import threading
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
@@ -42,8 +43,8 @@ def fetch_html(url, delay=1.5):
     except Exception:
         return ""
 
-def scrape_ranking(cat, url, list_type, log):
-    html = fetch_html(url, delay=2)
+def scrape_ranking(cat, url, list_type, log, fetch_details=True):
+    html = fetch_html(url, delay=1.0)
     if not html:
         log(f"  [{cat}] 取得失敗")
         return []
@@ -71,19 +72,25 @@ def scrape_ranking(cat, url, list_type, log):
     sorted_prods = sorted(products.values(), key=lambda x: x["rank"])
     log(f"  ランキング {len(sorted_prods)}件取得")
 
-    # 上位5件の詳細情報取得（価格・メーカー・月間販売数・仕入れ値）
-    for j, p in enumerate(sorted_prods[:5]):
-        log(f"  詳細取得 ({j+1}/5): {p['title'][:22]}...")
-        detail = fetch_amazon_detail(p["asin"], p.get("title", ""), cat)
-        if detail["price_num"]:
-            p["price_num"] = detail["price_num"]
-            p["price"]     = detail["price"]
-        if detail["reviews"]:
-            p["reviews"]   = detail["reviews"]
-        p["maker"]              = detail.get("maker", "")
-        p["monthly_sales"]      = detail.get("monthly_sales", 0)
-        p["supply_price"]       = detail.get("supply_price", 0)
-        p["supply_price_str"]   = detail.get("supply_price_str", "不明")
+    # 詳細取得（メインページのみ・並列）
+    if fetch_details:
+        def _fetch(p):
+            return p, fetch_amazon_detail(p["asin"], p.get("title", ""), cat)
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(_fetch, p): p for p in sorted_prods[:5]}
+            for future in as_completed(futures):
+                p, detail = future.result()
+                log(f"  詳細取得: {p['title'][:20]}... {detail['price']}")
+                if detail["price_num"]:
+                    p["price_num"] = detail["price_num"]
+                    p["price"]     = detail["price"]
+                if detail["reviews"]:
+                    p["reviews"]   = detail["reviews"]
+                p["maker"]            = detail.get("maker", "")
+                p["monthly_sales"]    = detail.get("monthly_sales", 0)
+                p["supply_price"]     = detail.get("supply_price", 0)
+                p["supply_price_str"] = detail.get("supply_price_str", "不明")
 
     return sorted_prods
 
@@ -91,62 +98,72 @@ TARGET_PER_CAT = 200
 
 def run_task(task_id, categories, source):
     t = tasks[task_id]
+    lock = threading.Lock()
 
     def log(msg):
-        t["logs"].append(msg)
+        with lock:
+            t["logs"].append(msg)
 
-    def scrape_with_subs(cat, base_url, list_type, seen_asins):
-        """メイン + サブカテゴリを使って target 件集める"""
-        cat_slug = base_url.rstrip("/").split("/")[-1]
+    def scrape_cat(cat):
+        """1カテゴリ分を取得（メイン=詳細あり、サブ=高速）"""
+        use_bs = source in ("bs", "both")
+        use_ms = source in ("ms", "both")
+        seen = set()
         prods = []
+        pages_needed = max(1, math.ceil(TARGET_PER_CAT / 30))
 
-        def add(url, ltype):
-            results = scrape_ranking(cat, url, ltype, log)
-            added = 0
-            for p in results:
-                if p["asin"] not in seen_asins:
-                    seen_asins.add(p["asin"])
-                    prods.append(p)
-                    added += 1
-            return added
-
-        log(f"[{list_type} メイン] {cat}")
-        add(base_url, list_type)
-
-        if len(prods) < TARGET_PER_CAT:
+        def fetch_pages(base_url, list_type):
+            cat_slug = base_url.rstrip("/").split("/")[-1]
             subs = discover_subcategories(base_url, cat_slug)
-            log(f"  サブカテゴリ {len(subs)}件 発見")
-            for sub_url in subs:
-                if len(prods) >= TARGET_PER_CAT:
-                    break
-                sub_id = sub_url.split("/")[-2]
-                log(f"  [{list_type} サブ/{sub_id}] 取得中...")
-                add(sub_url, f"{list_type}_sub")
+            log(f"[{list_type}] {cat}: メイン+サブ{len(subs)}件")
 
-        log(f"  ✓ {cat}: {len(prods)}件")
+            # メインページ: 詳細取得あり
+            main = scrape_ranking(cat, base_url, list_type, log, fetch_details=True)
+            for p in main:
+                with lock:
+                    if p["asin"] not in seen:
+                        seen.add(p["asin"])
+                        prods.append(p)
+
+            # サブカテゴリ: 詳細なし（並列・高速）
+            sub_urls = subs[: pages_needed - 1]
+            if sub_urls:
+                with ThreadPoolExecutor(max_workers=5) as ex:
+                    futures = [ex.submit(scrape_ranking, cat, u, f"{list_type}_sub", log, False) for u in sub_urls]
+                    for f in as_completed(futures):
+                        for p in f.result():
+                            with lock:
+                                if p["asin"] not in seen:
+                                    seen.add(p["asin"])
+                                    prods.append(p)
+
+            log(f"  ✓ [{list_type}] {cat}: {len(prods)}件")
+
+        if use_bs and cat in AMAZON_BS_URLS:
+            fetch_pages(AMAZON_BS_URLS[cat], "BS")
+        if use_ms and cat in AMAZON_MS_URLS:
+            fetch_pages(AMAZON_MS_URLS[cat], "MS")
+
         return prods
 
     try:
         use_bs = source in ("bs", "both")
         use_ms = source in ("ms", "both")
         all_prods = []
-        seen_asins = set()
-        total_steps = len(categories)
-        done = 0
+        total = len(categories)
 
-        for cat in categories:
-            t["pct"] = int(done / max(total_steps, 1) * 88)
-            t["label"] = f"{cat} 取得中..."
-
-            if use_bs and cat in AMAZON_BS_URLS:
-                prods = scrape_with_subs(cat, AMAZON_BS_URLS[cat], "BS", seen_asins)
+        # カテゴリを2並列で処理（Amazonへの負荷を考慮）
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {ex.submit(scrape_cat, cat): cat for cat in categories}
+            done = 0
+            for f in as_completed(futures):
+                cat = futures[f]
+                prods = f.result()
                 all_prods.extend(prods)
-
-            if use_ms and cat in AMAZON_MS_URLS:
-                prods = scrape_with_subs(cat, AMAZON_MS_URLS[cat], "MS", seen_asins)
-                all_prods.extend(prods)
-
-            done += 1
+                done += 1
+                t["pct"] = int(done / total * 90)
+                t["label"] = f"{cat} 完了 ({done}/{total})"
+                log(f"✓ {cat}: {len(prods)}件")
 
         log("スコアリング中...")
         for p in all_prods:

@@ -12,6 +12,7 @@ import math
 import re
 import json
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from urllib.parse import unquote, quote_plus
@@ -54,8 +55,8 @@ AMAZON_MS_URLS = {
 
 # ─── ユーティリティ ───────────────────────────────────────────
 
-def fetch(url, delay=1.5):
-    time.sleep(delay + random.uniform(0, 0.8))
+def fetch(url, delay=0.5):
+    time.sleep(delay + random.uniform(0, 0.3))
     req = Request(url, headers=HEADERS)
     try:
         with urlopen(req, timeout=20) as res:
@@ -224,9 +225,11 @@ def category_name_to_bsr_rank(title, html):
 
 # ─── Amazon ベストセラー / ムーバーズ スクレイパー ────────────
 
-def scrape_amazon_page(category_name, url, list_type="BS"):
-    """Amazon ランキングページをスクレイプ"""
-    html = fetch(url, delay=2)
+def scrape_amazon_page(category_name, url, list_type="BS", fetch_details=True):
+    """Amazon ランキングページをスクレイプ
+    fetch_details=False のときはランク・タイトル・評価のみ取得（高速）
+    """
+    html = fetch(url, delay=1.0)
     if not html:
         return []
 
@@ -241,16 +244,20 @@ def scrape_amazon_page(category_name, url, list_type="BS"):
             title = decode_url_title(slug)
             if title:
                 products[asin] = {
-                    "asin":      asin,
-                    "rank":      rank,
-                    "title":     title,
-                    "category":  category_name,
-                    "source":    f"Amazon_{list_type}",
-                    "price":     "不明",
-                    "price_num": 0,
-                    "rating":    0.0,
-                    "reviews":   0,
-                    "url":       f"https://www.amazon.co.jp/dp/{asin}/",
+                    "asin":           asin,
+                    "rank":           rank,
+                    "title":          title,
+                    "category":       category_name,
+                    "source":         f"Amazon_{list_type}",
+                    "price":          "不明",
+                    "price_num":      0,
+                    "rating":         0.0,
+                    "reviews":        0,
+                    "maker":          "",
+                    "monthly_sales":  0,
+                    "supply_price":   0,
+                    "supply_price_str": "不明",
+                    "url":            f"https://www.amazon.co.jp/dp/{asin}/",
                 }
 
     # Step2: 評価をASIN近傍HTMLから紐付け
@@ -259,22 +266,27 @@ def scrape_amazon_page(category_name, url, list_type="BS"):
         if asin in products:
             products[asin]["rating"] = rating
 
-    # Step3: 上位10件は個別ページで詳細取得
     sorted_prods = sorted(products.values(), key=lambda x: x["rank"])
-    print(f"    ランキング {len(sorted_prods)}件取得, 上位10件の詳細取得中...")
 
-    for p in sorted_prods[:10]:
-        detail = fetch_amazon_detail(p["asin"], p.get("title", ""), category_name)
-        if detail["price_num"]:
-            p["price_num"] = detail["price_num"]
-            p["price"]     = detail["price"]
-        if detail["reviews"]:
-            p["reviews"]   = detail["reviews"]
-        if detail["maker"]:
-            p["maker"]     = detail["maker"]
-        p["monthly_sales"]      = detail["monthly_sales"]
-        p["supply_price"]       = detail["supply_price"]
-        p["supply_price_str"]   = detail["supply_price_str"]
+    # Step3: メインページのみ詳細を並列取得（サブカテゴリはスキップで高速化）
+    if fetch_details:
+        def _fetch(p):
+            return p, fetch_amazon_detail(p["asin"], p.get("title", ""), category_name)
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(_fetch, p): p for p in sorted_prods[:5]}
+            for future in as_completed(futures):
+                p, detail = future.result()
+                if detail["price_num"]:
+                    p["price_num"] = detail["price_num"]
+                    p["price"]     = detail["price"]
+                if detail["reviews"]:
+                    p["reviews"]   = detail["reviews"]
+                if detail["maker"]:
+                    p["maker"]     = detail["maker"]
+                p["monthly_sales"]    = detail["monthly_sales"]
+                p["supply_price"]     = detail["supply_price"]
+                p["supply_price_str"] = detail["supply_price_str"]
 
     return sorted_prods
 
@@ -296,51 +308,52 @@ def discover_subcategories(base_url, cat_slug):
 
 
 def scrape_amazon(category_name, use_bs=True, use_ms=False, target=200):
-    """サブカテゴリを自動検出して合計 target 件取得"""
-    all_prods = []
+    """サブカテゴリを並列取得して合計 target 件返す"""
     seen_asins = set()
+    lock = __import__("threading").Lock()
 
-    def add_from_page(url, list_type):
-        prods = scrape_amazon_page(category_name, url, list_type)
-        added = 0
-        for p in prods:
-            if p["asin"] not in seen_asins:
-                seen_asins.add(p["asin"])
-                all_prods.append(p)
-                added += 1
-        return added
+    def fetch_page(url, list_type):
+        return scrape_amazon_page(category_name, url, list_type)
 
+    def collect(base_url, list_type):
+        cat_slug = base_url.rstrip("/").split("/")[-1]
+        subs = discover_subcategories(base_url, cat_slug)
+        pages_needed = max(1, math.ceil(target / 30))
+
+        results = []
+
+        # メインページ: 詳細あり
+        main_prods = scrape_amazon_page(category_name, base_url, list_type, fetch_details=True)
+        for p in main_prods:
+            with lock:
+                if p["asin"] not in seen_asins:
+                    seen_asins.add(p["asin"])
+                    results.append(p)
+
+        # サブカテゴリ: 詳細なし（高速）
+        sub_urls = subs[: pages_needed - 1]
+        if sub_urls:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futures = [ex.submit(scrape_amazon_page, category_name, u, f"{list_type}_sub", False) for u in sub_urls]
+                for f in as_completed(futures):
+                    for p in f.result():
+                        with lock:
+                            if p["asin"] not in seen_asins:
+                                seen_asins.add(p["asin"])
+                                results.append(p)
+
+        return results
+
+    all_prods = []
     if use_bs and category_name in AMAZON_BS_URLS:
-        base_url = AMAZON_BS_URLS[category_name]
-        cat_slug  = base_url.rstrip("/").split("/")[-1]
-
-        # メインページ
-        print(f"  [BS メイン] {category_name}...")
-        add_from_page(base_url, "BS")
-
-        # 不足分をサブカテゴリで補う
-        if len(all_prods) < target:
-            subs = discover_subcategories(base_url, cat_slug)
-            print(f"  サブカテゴリ {len(subs)}件 発見")
-            for sub_url in subs:
-                if len(all_prods) >= target:
-                    break
-                print(f"  [BS サブ] {sub_url.split('/')[-2]}...")
-                add_from_page(sub_url, "BS_sub")
+        prods = collect(AMAZON_BS_URLS[category_name], "BS")
+        all_prods.extend(prods)
+        print(f"  [BS] {category_name}: {len(prods)}件")
 
     if use_ms and category_name in AMAZON_MS_URLS:
-        base_url = AMAZON_MS_URLS[category_name]
-        cat_slug  = base_url.rstrip("/").split("/")[-1]
-        print(f"  [MS メイン] {category_name}...")
-        add_from_page(base_url, "MS")
-
-        if len(all_prods) < target:
-            subs = discover_subcategories(base_url, cat_slug)
-            for sub_url in subs:
-                if len(all_prods) >= target:
-                    break
-                print(f"  [MS サブ] {sub_url.split('/')[-2]}...")
-                add_from_page(sub_url, "MS_sub")
+        prods = collect(AMAZON_MS_URLS[category_name], "MS")
+        all_prods.extend(prods)
+        print(f"  [MS] {category_name}: {len(prods)}件")
 
     print(f"  → {category_name} 合計 {len(all_prods)}件")
     return all_prods
